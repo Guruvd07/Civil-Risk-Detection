@@ -23,7 +23,7 @@ Pipeline:
           ↓
     Relevant FIDIC clauses
 """
-
+import os
 from pathlib import Path
 import re
 
@@ -72,11 +72,7 @@ MODEL = SentenceTransformer(
     "BAAI/bge-small-en-v1.5"
 )
 
-print("Loading cross-encoder reranker...")
-
-RERANKER = CrossEncoder(
-    "cross-encoder/ms-marco-MiniLM-L-6-v2"
-)
+RERANKER = None
 
 
 print("Loading FAISS index...")
@@ -1166,69 +1162,54 @@ def cross_encoder_rerank(
     candidates: pd.DataFrame,
     batch_size: int = 16,
 ):
-    """
-    Rerank semantic candidates using the original risk description
-    and each candidate clause/chunk as a query-document pair.
-    """
+    """Rerank candidates, with a low-memory deployment fallback."""
+
+    global RERANKER
 
     if candidates.empty:
         return candidates
 
+    candidates = candidates.copy()
+
+    # Low-memory mode: avoid loading the cross-encoder model.
+    if os.getenv("DISABLE_CROSS_ENCODER", "0") == "1":
+        candidates["cross_encoder_score"] = candidates[
+            "semantic_score"
+        ].astype(float)
+        return candidates
+
+    # Load the model only when reranking is actually required.
+    if RERANKER is None:
+        print("Loading cross-encoder reranker...")
+        RERANKER = CrossEncoder(
+            "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            device="cpu",
+        )
+
     pairs = []
 
     for _, row in candidates.iterrows():
-
-        clause_title = str(
-            row.get("clause_title", "")
-        )
-
-        clause_text = str(
-            row.get("chunk_text", "")
-        )
-
         clause_context = (
-            f"{clause_title}. {clause_text}"
+            f"{row.get('clause_title', '')}. "
+            f"{row.get('chunk_text', '')}"
         )[:5000]
 
-        pairs.append(
-            (
-                str(query),
-                clause_context,
-            )
-        )
-
-    raw_scores = RERANKER.predict(
-        pairs,
-        batch_size=batch_size,
-        show_progress_bar=False,
-    )
+        pairs.append((str(query), clause_context))
 
     raw_scores = np.asarray(
-        raw_scores,
+        RERANKER.predict(
+            pairs,
+            batch_size=batch_size,
+            show_progress_bar=False,
+        ),
         dtype=np.float32,
     )
 
-    raw_scores = np.clip(
-        raw_scores,
-        -50.0,
-        50.0,
+    raw_scores = np.clip(raw_scores, -50.0, 50.0)
+
+    candidates["cross_encoder_score"] = (
+        1.0 / (1.0 + np.exp(-raw_scores))
     )
-
-    rerank_scores = (
-        1.0
-        /
-        (
-            1.0
-            +
-            np.exp(-raw_scores)
-        )
-    )
-
-    candidates = candidates.copy()
-
-    candidates[
-        "cross_encoder_score"
-    ] = rerank_scores
 
     return candidates
 
